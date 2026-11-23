@@ -64,7 +64,12 @@ https://<GitHubユーザー名>.github.io/<リポジトリ名>/
 1. 新しいスプレッドシートを作成 → メニュー「拡張機能」→「Apps Script」
 2. `Code.gs` の中身を `gas/Code.gs` で置き換える
 3. 左の歯車「プロジェクトの設定」→「"appsscript.json" マニフェスト ファイルをエディタで表示する」にチェック → `appsscript.json` を `gas/appsscript.json` で置き換える
-4. 「スクリプト プロパティ」に以下を追加
+4. 「スクリプト プロパティ」に以下を追加(**方法A: 手入力** / **方法B: ローカルファイルから設定**。Bがおすすめ)
+
+   **方法B(おすすめ)**: `gas/Secrets.gs.example` を `gas/Secrets.gs` にコピーして値を入れる → `npm run push` → GASエディタで関数 `setScriptProperties` を1回実行。`gas/Secrets.gs` は `.gitignore` 済みなので、GitHubには上がりません。実行後は値を消してもう一度 `npm run push` すると、GAS側のファイルにも値が残りません(設定した値はスクリプトプロパティに保存されたままです)。
+
+   **方法A**: GASの画面で、次のプロパティを1つずつ入力
+
 
 | プロパティ | 値 |
 |---|---|

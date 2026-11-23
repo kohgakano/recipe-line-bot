@@ -3,3 +3,8 @@ node_modules/
 *.log
 # clasp のログイン情報(絶対にコミットしない)
 .clasprc.json
+# 秘密情報(ローカル専用)
+gas/Secrets.gs
+.env.local
+# ローカル専用ファイル(*.local.txt など)
+*.local.*
