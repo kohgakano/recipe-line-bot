@@ -28,6 +28,8 @@ const HELP = [
   '【登録】(1対1のトークで)',
   '・YouTubeのURLを送る → 動画からレシピを作成',
   '・料理の写真/レシピ画像を送る → 画像からレシピを作成',
+  '  (材料と手順が別の画像でもOK。最大5枚まで1つのレシピにまとめます)',
+  '  まとめて選んで送ると自動で解析。1枚ずつ送った場合は、全部送ってから「解析」と送ります(「キャンセル」で取り消し)',
   '・「手動登録」 → 自分で入力',
   '解析後は確認画面が出るので、修正して保存できます。',
   '',
@@ -139,6 +141,12 @@ function onText_(ev, raw) {
 
   if (/^(ヘルプ|help|使い方|\?|？)$/i.test(t)) return send_(ev, text_(HELP));
 
+  if (!isGroup_(ev) && /^(解析|解析する|まとめて解析|完了)$/.test(t)) return onAnalyzeCommand_(ev);
+  if (!isGroup_(ev) && /^(キャンセル|取り消し|取消)$/.test(t)) {
+    const n = clearQueue_(ev.source.userId).length;
+    return send_(ev, text_(n ? '預かっていた画像 ' + n + '枚を破棄しました。' : '預かっている画像はありません。'));
+  }
+
   if (/^(一覧|レシピ一覧|新着)$/.test(t)) {
     const rs = confirmed_().sort(byNewest_);
     if (!rs.length) return send_(ev, text_('まだレシピが登録されていません。YouTubeのURLか画像を送ってみてください。'));
@@ -165,15 +173,134 @@ function onText_(ev, raw) {
   return smartSearch_(ev, t);
 }
 
+/* ---------- 画像: 複数枚を預かって1つのレシピにまとめる ---------- */
+
+const IMG_MAX = 5;                 // 1レシピにまとめる最大枚数(予備先のGroqが1回5枚まで)
+const IMG_TTL_MS = 30 * 60 * 1000; // 預かった画像を捨てるまでの時間
+const IMG_TOTAL_MAX_BYTES = 14 * 1024 * 1024; // Geminiのinline上限(約20MB)に対する安全マージン
+
+function queueKey_(uid) { return 'imgq_' + uid; }
+
+function loadQueue_(uid) {
+  const raw = CacheService.getScriptCache().get(queueKey_(uid));
+  let q = { items: [], warned: false };
+  if (raw) { try { q = JSON.parse(raw); } catch (e) { /* noop */ } }
+  const now = Date.now();
+  q.items = (q.items || []).filter(function (i) { return now - i.ts < IMG_TTL_MS; });
+  return q;
+}
+
+function saveQueue_(uid, q) {
+  const cache = CacheService.getScriptCache();
+  if (!q.items.length) cache.remove(queueKey_(uid));
+  else cache.put(queueKey_(uid), JSON.stringify(q), 3600);
+}
+
+/** 預かっている画像を取り出して空にする(送った順に並べて返す) */
+function takeQueue_(uid) {
+  return withLock_(function () {
+    const q = loadQueue_(uid);
+    saveQueue_(uid, { items: [], warned: false });
+    return sortItems_(q.items);
+  });
+}
+function clearQueue_(uid) { return takeQueue_(uid); }
+
+/** 解析に失敗したとき、画像を預かった状態に戻す(再試行できるように) */
+function restoreQueue_(uid, items) {
+  withLock_(function () {
+    const q = loadQueue_(uid);
+    items.forEach(function (i) { if (!q.items.some(function (x) { return x.id === i.id; })) q.items.push(i); });
+    saveQueue_(uid, q);
+  });
+}
+
+/** 同時送信の画像は index 順、別々に送った画像は到着順 */
+function sortItems_(items) {
+  const first = {};
+  items.forEach(function (i) {
+    const k = i.set || i.id;
+    first[k] = first[k] === undefined ? i.ts : Math.min(first[k], i.ts);
+  });
+  return items.slice().sort(function (a, b) {
+    return (first[a.set || a.id] - first[b.set || b.id]) || (a.idx - b.idx);
+  });
+}
+
+/**
+ * 画像を1枚預かる。戻り値の status:
+ *  dup=受信済み / full=上限 / ready=同時送信が全部そろった(items を解析する) / queued=預かった
+ */
+function queueImage_(uid, msg) {
+  return withLock_(function () {
+    const q = loadQueue_(uid);
+    if (q.items.some(function (i) { return i.id === msg.id; })) return { status: 'dup' };
+    if (q.items.length >= IMG_MAX) {
+      const first = !q.warned;
+      q.warned = true;
+      saveQueue_(uid, q);
+      return { status: 'full', first: first };
+    }
+    // 同時に選んで送った画像: imageSet.total が分かるときだけ自動で解析できる
+    const set = msg.imageSet && msg.imageSet.id && msg.imageSet.total > 1 ? msg.imageSet : null;
+    q.items.push({ id: msg.id, set: set ? set.id : '', idx: set ? (set.index || 0) : 0, ts: Date.now() });
+    if (set && q.items.filter(function (i) { return i.set === set.id; }).length >= set.total) {
+      saveQueue_(uid, { items: [], warned: false });
+      return { status: 'ready', items: sortItems_(q.items) };
+    }
+    saveQueue_(uid, q);
+    return { status: 'queued', count: q.items.length, inSet: !!set };
+  });
+}
+
+function quickReplyAnalyze_() {
+  return {
+    items: [
+      { type: 'action', action: { type: 'message', label: '解析する', text: '解析' } },
+      { type: 'action', action: { type: 'message', label: 'キャンセル', text: 'キャンセル' } },
+    ],
+  };
+}
+
 function onImage_(ev) {
   if (isGroup_(ev)) return; // グループの写真には反応しない(無料枠の節約)
-  startWait_(ev, '画像を解析中です…(20秒ほどかかります)');
+  const uid = ev.source.userId;
+  if (!uid) return;
+  const r = queueImage_(uid, ev.message);
+  if (r.status === 'dup') return;
+  if (r.status === 'full') {
+    if (r.first) {
+      send_(ev, { type: 'text', text: '1つのレシピにまとめられるのは最大' + IMG_MAX + '枚までです。\n預かった' + IMG_MAX + '枚で「解析」するか、「キャンセル」してやり直してください。', quickReply: quickReplyAnalyze_() });
+    }
+    return;
+  }
+  if (r.status === 'ready') return analyzeQueued_(ev, r.items);
+  // 同時送信の途中の画像には返信しない(全部そろったら解析が始まる)。単独の画像は確認を返す
+  if (!r.inSet) {
+    send_(ev, { type: 'text', text: '📷 ' + r.count + '枚を預かりました(最大' + IMG_MAX + '枚)。\n続けて送るか、下のボタンで進めてください。', quickReply: quickReplyAnalyze_() });
+  }
+}
+
+function onAnalyzeCommand_(ev) {
+  const uid = ev.source.userId;
+  const items = uid ? takeQueue_(uid) : [];
+  if (!items.length) return send_(ev, text_('預かっている画像がありません。\n(解析中の場合は、そのままお待ちください。しばらく経った画像は自動で破棄されるので、もう一度送ってください)'));
+  return analyzeQueued_(ev, items);
+}
+
+function analyzeQueued_(ev, items) {
+  startWait_(ev, items.length + '枚の画像を解析中です…(20秒ほどかかります)');
   let data;
   try {
-    const blob = fetchLineContent_(ev.message.id);
-    data = analyzeImage_(blob);
+    const blobs = items.map(function (i) { return fetchLineContent_(i.id); });
+    const total = blobs.reduce(function (sum, b) { return sum + b.getBytes().length; }, 0);
+    if (total > IMG_TOTAL_MAX_BYTES) throw new Error('TOO_BIG');
+    data = analyzeImages_(blobs);
   } catch (err) {
-    return send_(ev, text_(friendlyError_(err)));
+    const m = String(err.message || err);
+    const hint = m === 'TOO_BIG' ? '' : '\n\n画像は預かったままです。「解析」で再試行、「キャンセル」で破棄できます。';
+    if (m !== 'TOO_BIG') restoreQueue_(ev.source.userId, items);
+    return send_(ev, { type: 'text', text: friendlyError_(err) + hint, quickReply: m === 'TOO_BIG' ? undefined : quickReplyAnalyze_() });
   }
   const r = saveNew_(Object.assign(data, { source_type: 'image', created_by: ev.source.userId || '' }));
   send_(ev, draftFlex_(r));
@@ -507,14 +634,18 @@ function analyzeYouTube_(url) {
   }));
 }
 
-function analyzeImage_(blob) {
-  const mime = blob.getContentType() || 'image/jpeg';
-  const b64 = Utilities.base64Encode(blob.getBytes());
-  const prompt = PROMPT_COMMON + '\n\nこの画像(料理写真、またはレシピのスクリーンショット/本のページ/手書きメモ)からレシピを抽出してください。文字が読める場合はその内容を優先し、写真のみの場合は見た目から推定できる範囲にとどめてください。';
+function analyzeImages_(blobs) {
+  const imgs = blobs.map(function (b) {
+    return { mime: b.getContentType() || 'image/jpeg', b64: Utilities.base64Encode(b.getBytes()) };
+  });
+  const task = imgs.length > 1
+    ? '\n\nこれらの' + imgs.length + '枚の画像は、同じ1つのレシピの一部です(材料のページ、作り方のページなど)。送られた順に並んでいます。全体を統合して1つのレシピにしてください。重複する内容は1つにまとめてください。'
+    : '\n\nこの画像(料理写真、またはレシピのスクリーンショット/本のページ/手書きメモ)からレシピを抽出してください。文字が読める場合はその内容を優先し、写真のみの場合は見た目から推定できる範囲にとどめてください。';
+  const prompt = PROMPT_COMMON + task;
   const attempts = [];
   listProp_('IMAGE_PROVIDERS', 'gemini,groq,openrouter').forEach(function (p) {
     if (p === 'gemini' && prop_('GEMINI_API_KEY')) {
-      const parts = [{ inline_data: { mime_type: mime, data: b64 } }, { text: prompt }];
+      const parts = imgs.map(function (i) { return { inline_data: { mime_type: i.mime, data: i.b64 } }; }).concat([{ text: prompt }]);
       geminiModels_().forEach(function (m) {
         attempts.push({ name: 'gemini:' + m, fn: function () { return callGemini_(m, parts); } });
       });
@@ -522,8 +653,8 @@ function analyzeImage_(blob) {
       listProp_('GROQ_MODELS', 'meta-llama/llama-4-scout-17b-16e-instruct').forEach(function (m) {
         attempts.push({
           name: 'groq:' + m, fn: function () {
-            if (b64.length > 3.5e6) throw new Error('TOO_BIG'); // Groqはbase64画像のサイズ上限が小さいため保険
-            return callOpenAiCompat_('https://api.groq.com/openai/v1/chat/completions', prop_('GROQ_API_KEY'), m, prompt + JSON_TAIL, mime, b64);
+            if (imgs.some(function (i) { return i.b64.length > 3.5e6; })) throw new Error('TOO_BIG'); // Groqはbase64画像のサイズ上限が小さいため保険
+            return callOpenAiCompat_('https://api.groq.com/openai/v1/chat/completions', prop_('GROQ_API_KEY'), m, prompt + JSON_TAIL, imgs);
           },
         });
       });
@@ -531,7 +662,7 @@ function analyzeImage_(blob) {
       listProp_('OPENROUTER_MODELS', 'openrouter/free').forEach(function (m) {
         attempts.push({
           name: 'openrouter:' + m, fn: function () {
-            return callOpenAiCompat_('https://openrouter.ai/api/v1/chat/completions', prop_('OPENROUTER_API_KEY'), m, prompt + JSON_TAIL, mime, b64);
+            return callOpenAiCompat_('https://openrouter.ai/api/v1/chat/completions', prop_('OPENROUTER_API_KEY'), m, prompt + JSON_TAIL, imgs);
           },
         });
       });
@@ -593,13 +724,12 @@ function callGemini_(model, parts) {
 }
 
 /** Groq / OpenRouter (OpenAI互換API)で画像を解析 */
-function callOpenAiCompat_(url, key, model, prompt, mime, b64) {
+function callOpenAiCompat_(url, key, model, prompt, imgs) {
   const payload = {
     model: model, temperature: 0.2,
-    messages: [{ role: 'user', content: [
-      { type: 'text', text: prompt },
-      { type: 'image_url', image_url: { url: 'data:' + mime + ';base64,' + b64 } },
-    ] }],
+    messages: [{ role: 'user', content: [{ type: 'text', text: prompt }].concat(imgs.map(function (i) {
+      return { type: 'image_url', image_url: { url: 'data:' + i.mime + ';base64,' + i.b64 } };
+    })) }],
   };
   const res = UrlFetchApp.fetch(url, {
     method: 'post', contentType: 'application/json', headers: { Authorization: 'Bearer ' + key },
@@ -638,6 +768,7 @@ function friendlyError_(err) {
   const m = String(err.message || err);
   if (m === 'NOT_RECIPE') return 'レシピとして読み取れませんでした。\n動画の場合は「公開」設定か、料理動画かをご確認ください。画像は文字がはっきり写っているものだと精度が上がります。';
   if (m === 'QUOTA') return '設定している解析サービスの無料枠がすべて上限に達しました。少し時間をおいてからもう一度お試しください。';
+  if (m === 'TOO_BIG') return '画像の合計サイズが大きすぎます。枚数を減らすか、小さい画像でやり直してください。';
   if (m === 'BLOCKED') return '解析できませんでした(動画が非公開、または年齢制限などの可能性があります)。';
   return '解析に失敗しました。\n' + m.slice(0, 200);
 }
