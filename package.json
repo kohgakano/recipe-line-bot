@@ -1,0 +1,13 @@
+{
+  "name": "recipe-line-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "家族で共有するレシピ LINE Bot (GAS + LIFF)",
+  "scripts": {
+    "login": "npx @google/clasp login",
+    "push": "npx @google/clasp push",
+    "watch": "npx @google/clasp push --watch",
+    "open": "npx @google/clasp open-script",
+    "logs": "npx @google/clasp logs"
+  }
+}

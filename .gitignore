@@ -1,0 +1,5 @@
+node_modules/
+.DS_Store
+*.log
+# clasp のログイン情報(絶対にコミットしない)
+.clasprc.json
