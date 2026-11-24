@@ -822,7 +822,7 @@ function toRecipe_(obj) {
     }).filter(function (i) { return i.name; }),
     steps: (obj.steps || []).map(function (s) { return String(s).trim(); }).filter(Boolean),
     memo: String(obj.memo || '').trim(),
-    tools: normTools_(obj.tools),
+    tools: normTools_(obj.tools).length ? normTools_(obj.tools) : inferTools_((obj.steps || []).join('\n')),
   };
 }
 
@@ -1001,6 +1001,8 @@ function recipeFromJsonLd_(html) {
     const x = str(v); if (x) steps.push(x);
   })(r.recipeInstructions);
   if (!ingredients.length || !steps.length) return null;
+  // 作り方が「（A）を入れて」と書いているのに材料にグループがない → 構造化データが見出しを欠いているので、本文をAIで読む
+  if (/[（(][A-ZＡ-Ｚ][）)]|[A-ZＡ-Ｚ]を(?:加|入|混|合|か)/.test(steps.join('\n')) && !ingredients.some(function (i) { return i.group; })) return null;
   let yieldS = [].concat(r.recipeYield || '').map(str)[0] || '';
   if (/^\d+$/.test(yieldS)) yieldS += '人分';
   return {
@@ -1013,6 +1015,10 @@ function recipeFromJsonLd_(html) {
 function groupHeader_(line) {
   const t = String(line).trim();
   let m = t.match(/^[【＜<\[［（(]\s*([^】＞>\]］）)]{1,20}?)\s*[】＞>\]］）)]$/);
+  if (!m) { // 「（A）煮汁」のように、記号の後ろに名前だけが続く行(分量なし)は「A 煮汁」という見出し
+    const k = t.match(/^[【＜<\[［（(]\s*([A-ZＡ-Ｚ])\s*[】＞>\]］）)][\s\u3000]*([^\s\u3000\d０-９]{1,15})$/);
+    if (k) return k[1] + ' ' + k[2];
+  }
   if (!m) m = t.match(/^([^\s:：]{1,15})[:：]$/);
   if (!m) m = t.match(/^([A-ZＡ-Ｚ])$/);
   return m ? m[1].trim() : null;

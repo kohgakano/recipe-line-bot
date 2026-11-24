@@ -48,12 +48,14 @@
   .ing .amt { flex: 0 1 30%; min-width: 0; text-align: right; padding: 8px 0; }
 
   /* 材料のグループ見出し(A / 合わせ調味料 など) */
-  .grp { display: flex; align-items: center; gap: 6px; margin-top: 18px; padding: 2px 0; border-bottom: 2px solid var(--marker); }
+  .grp { display: flex; align-items: center; gap: 6px; margin-top: 34px; margin-bottom: 4px; padding: 2px 0; border-bottom: 2px solid var(--marker); }
   .grp .gname { flex: 1 1 auto; min-width: 0; padding: 8px 0; font-weight: 700; }
   .grp:first-child { margin-top: 0; }
   .grp .gadd { flex: none; border: 0; background: none; color: var(--ink); font-weight: 700; font-size: 13px; text-decoration: underline; text-decoration-color: var(--marker); text-decoration-thickness: 3px; text-underline-offset: 4px; cursor: pointer; padding: 8px 2px; }
-  .ing { flex-wrap: wrap; }
-  .ing .gsel { display: none; order: 9; flex: 0 0 auto; width: 58%; margin: 0 0 8px; padding: 6px 10px; font: inherit; font-size: 13px; color: var(--ink-soft); background: #fff; border: 1px solid var(--rule); border-radius: 8px; }
+  .ing { flex-wrap: wrap; padding: 8px 0 10px; }
+  .ing .name { flex-basis: 46%; }
+  .ing .amt { flex-basis: 26%; }
+  .ing .gsel { display: none; order: 9; flex: 0 0 auto; margin: 0 0 4px; padding: 2px 18px 2px 0; font: inherit; font-size: 13px; color: var(--ink-soft); background: transparent url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%235A6780' stroke-width='1.5'/%3E%3C/svg%3E") no-repeat right center; border: 0; border-radius: 0; -webkit-appearance: none; appearance: none; }
   #ings.has-groups .gsel { display: block; }
   .hint { margin: 6px 0 0; color: var(--ink-soft); font-size: 13px; line-height: 1.6; }
   .add-row { display: flex; gap: 20px; flex-wrap: wrap; }
