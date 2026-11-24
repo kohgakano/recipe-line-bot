@@ -78,7 +78,7 @@ https://<GitHubユーザー名>.github.io/<リポジトリ名>/
 | LIFF_ID | 手順3のLIFF ID |
 | LIFF_CHANNEL_ID | 手順3のLINEログインチャネルのChannel ID |
 | GEMINI_API_KEY | 手順4のキー |
-| GEMINI_MODELS | (任意)使うGeminiモデルをカンマ区切りで優先順に。既定は `gemini-flash-latest,gemini-flash-lite-latest`。AI Studioで実在するモデル名に合わせてください |
+| GEMINI_MODELS | (任意)使うGeminiモデルをカンマ区切りで優先順に。既定は `gemini-flash-latest,gemini-2.5-flash,gemini-flash-lite-latest`(混雑・枠切れのとき次のモデルへ自動で切り替わります)。AI Studioで実在するモデル名に合わせてください |
 | GROQ_API_KEY | (任意)画像解析のフォールバック先。[Groq](https://console.groq.com/)のAPIキー(無料・カード不要) |
 | GROQ_MODELS | (任意)既定は `meta-llama/llama-4-scout-17b-16e-instruct`(画像入力対応のモデルを指定) |
 | OPENROUTER_API_KEY | (任意)画像解析のさらに先のフォールバック。[OpenRouter](https://openrouter.ai/)のキー |
@@ -107,6 +107,8 @@ LINE Developers の Messaging API 設定 → Webhook URL に
 ## 8. 動作確認
 公式アカウントを友だち追加し、YouTubeのURL(公開動画)を送る → 確認画面が出ます。
 
+レシピサイトのURLを送ると、ページからレシピを作ります。ページに埋め込まれたレシピ情報(schema.org)があればAIを使わずに読み取り(材料の「名前/分量」の分割は簡易的なので、確認画面で直してください)、なければ本文をAIで解析します。ログイン必須・有料会員限定のページや、アクセスを断るサイトは読み取れません。他人のレシピは家族内の個人利用にとどめてください。
+
 ## clasp でGASをコマンドから更新する(任意)
 エディタに貼り付ける代わりに、手元のファイルをコマンドでGASへ反映できます。
 
@@ -125,6 +127,7 @@ LINE Developers の Messaging API 設定 → Webhook URL に
 画像は `IMAGE_PROVIDERS` の順に、**Geminiの各モデル → Groq → OpenRouter(:free)** と試します。無料枠切れ(429)やエラーなら自動で次へ進み、枠切れした先は5分間スキップします。確認カードの下に「解析: どこで解析したか」が出るので、フォールバック先(精度が落ちやすい)かどうか分かります。
 - キーを設定したサービスだけが使われます(Geminiだけでも動きます)
 - YouTube動画はURLを直接読めるのがGeminiだけなので、Geminiのモデル間でのみ切り替わります
+- Geminiが混雑(503)のときは、2秒・4秒待って最大3回試し、だめなら次のモデルへ。全部だめなら「混雑しています」と表示し、画像は「解析」で再試行できます
 - 1つのサービスで複数アカウント/キーを作って枠を増やす運用は、効果がない・規約上の問題があるため非対応です
 
 ## 家族で使うには

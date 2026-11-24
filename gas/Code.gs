@@ -10,7 +10,7 @@
  *   LIFF_ID                    LIFFアプリのID
  *   LIFF_CHANNEL_ID            LIFFを作った LINEログインチャネルの Channel ID
  *   GEMINI_API_KEY             Google AI Studio のAPIキー
- *   GEMINI_MODELS              (任意) 使うモデルをカンマ区切りで優先順に。既定: gemini-flash-latest,gemini-flash-lite-latest
+ *   GEMINI_MODELS              (任意) 使うモデルをカンマ区切りで優先順に。既定: gemini-flash-latest,gemini-2.5-flash,gemini-flash-lite-latest
  *   GROQ_API_KEY / GROQ_MODELS             (任意) 画像解析のフォールバック先(Groq)
  *   OPENROUTER_API_KEY / OPENROUTER_MODELS (任意) 画像解析のフォールバック先(OpenRouterの:free)
  *   IMAGE_PROVIDERS            (任意) 画像解析の試す順。既定: gemini,groq,openrouter
@@ -30,6 +30,7 @@ const HELP = [
   '・料理の写真/レシピ画像を送る → 画像からレシピを作成',
   '  (材料と手順が別の画像でもOK。最大5枚まで1つのレシピにまとめます)',
   '  まとめて選んで送ると自動で解析。1枚ずつ送った場合は、全部送ってから「解析」と送ります(「キャンセル」で取り消し)',
+  '・レシピサイトのURLを送る → ページからレシピを作成',
   '・「手動登録」 → 自分で入力',
   '解析後は確認画面が出るので、修正して保存できます。',
   '',
@@ -138,6 +139,9 @@ function onText_(ev, raw) {
 
   const ytId = extractYouTubeId_(t);
   if (ytId && !isGroup_(ev)) return onYouTube_(ev, ytId);
+
+  const webUrl = extractWebUrl_(t);
+  if (webUrl && !isGroup_(ev)) return onWebPage_(ev, webUrl);
 
   if (/^(ヘルプ|help|使い方|\?|？)$/i.test(t)) return send_(ev, text_(HELP));
 
@@ -317,6 +321,18 @@ function onYouTube_(ev, videoId) {
   }
   if (!data.title) data.title = youTubeTitle_(url);
   const r = saveNew_(Object.assign(data, { source_type: 'youtube', source_url: url, created_by: ev.source.userId || '' }));
+  send_(ev, draftFlex_(r));
+}
+
+function onWebPage_(ev, url) {
+  startWait_(ev, 'ページを読み取り中です…');
+  let data;
+  try {
+    data = analyzeWebPage_(url);
+  } catch (err) {
+    return send_(ev, text_(friendlyError_(err)));
+  }
+  const r = saveNew_(Object.assign(data, { source_type: 'web', source_url: url, created_by: ev.source.userId || '' }));
   send_(ev, draftFlex_(r));
 }
 
@@ -613,7 +629,7 @@ const PROMPT_COMMON = [
 ].join('\n');
 
 function geminiModels_() {
-  const l = prop_('GEMINI_MODELS') || prop_('GEMINI_MODEL') || 'gemini-flash-latest,gemini-flash-lite-latest';
+  const l = prop_('GEMINI_MODELS') || prop_('GEMINI_MODEL') || 'gemini-flash-latest,gemini-2.5-flash,gemini-flash-lite-latest';
   return l.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
 }
 function listProp_(key, def) {
@@ -641,7 +657,11 @@ function analyzeImages_(blobs) {
   const task = imgs.length > 1
     ? '\n\nこれらの' + imgs.length + '枚の画像は、同じ1つのレシピの一部です(材料のページ、作り方のページなど)。送られた順に並んでいます。全体を統合して1つのレシピにしてください。重複する内容は1つにまとめてください。'
     : '\n\nこの画像(料理写真、またはレシピのスクリーンショット/本のページ/手書きメモ)からレシピを抽出してください。文字が読める場合はその内容を優先し、写真のみの場合は見た目から推定できる範囲にとどめてください。';
-  const prompt = PROMPT_COMMON + task;
+  return analyzeParts_(PROMPT_COMMON + task, imgs);
+}
+
+/** 画像(0枚でも可)とプロンプトを、Gemini → Groq → OpenRouter の順に試す */
+function analyzeParts_(prompt, imgs) {
   const attempts = [];
   listProp_('IMAGE_PROVIDERS', 'gemini,groq,openrouter').forEach(function (p) {
     if (p === 'gemini' && prop_('GEMINI_API_KEY')) {
@@ -677,7 +697,7 @@ function chain_(attempts) {
   const cache = CacheService.getScriptCache();
   const live = attempts.filter(function (a) { return !cache.get('cool_' + a.name); });
   const order = live.length ? live : attempts;
-  let lastErr = null, quotaCount = 0;
+  let lastErr = null, quotaCount = 0, busyCount = 0;
   for (let i = 0; i < order.length; i++) {
     const a = order[i];
     try {
@@ -689,11 +709,13 @@ function chain_(attempts) {
       const m = String(e.message || e);
       if (m === 'NOT_RECIPE') throw e;
       if (m === 'QUOTA') { quotaCount++; cache.put('cool_' + a.name, '1', 300); }
+      if (m === 'BUSY') busyCount++;
       console.warn(a.name + ' failed: ' + m.slice(0, 200));
       lastErr = e;
     }
   }
   if (quotaCount === order.length) throw new Error('QUOTA');
+  if (quotaCount + busyCount === order.length) throw new Error('BUSY'); // 枠切れ+混雑で全滅
   throw lastErr;
 }
 
@@ -706,16 +728,18 @@ function callGemini_(model, parts) {
     generationConfig: { responseMimeType: 'application/json', responseSchema: RECIPE_SCHEMA, temperature: 0.2 },
   };
   let res, code;
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
     res = UrlFetchApp.fetch(url, {
       method: 'post', contentType: 'application/json', headers: { 'x-goog-api-key': key },
       payload: JSON.stringify(payload), muteHttpExceptions: true,
     });
     code = res.getResponseCode();
     if (code !== 503 && code !== 500) break;
-    Utilities.sleep(2000 * attempt);
+    if (attempt < 3) Utilities.sleep(2000 * attempt); // 混雑時は 2秒→4秒 待って再試行
   }
   if (code === 429) throw new Error('QUOTA');
+  if (code === 503 || code === 500) throw new Error('BUSY');
+  if (code === 401 || code === 403) throw new Error('AUTH');
   if (code !== 200) throw new Error('Gemini error ' + code + ': ' + res.getContentText().slice(0, 300));
   const json = JSON.parse(res.getContentText());
   const cand = json.candidates && json.candidates[0];
@@ -737,6 +761,7 @@ function callOpenAiCompat_(url, key, model, prompt, imgs) {
   });
   const code = res.getResponseCode();
   if (code === 429) throw new Error('QUOTA');
+  if (code === 503 || code === 500 || code === 502) throw new Error('BUSY');
   if (code !== 200) throw new Error(model + ' error ' + code + ': ' + res.getContentText().slice(0, 300));
   const json = JSON.parse(res.getContentText());
   const content = json.choices && json.choices[0] && json.choices[0].message && json.choices[0].message.content;
@@ -769,8 +794,137 @@ function friendlyError_(err) {
   if (m === 'NOT_RECIPE') return 'レシピとして読み取れませんでした。\n動画の場合は「公開」設定か、料理動画かをご確認ください。画像は文字がはっきり写っているものだと精度が上がります。';
   if (m === 'QUOTA') return '設定している解析サービスの無料枠がすべて上限に達しました。少し時間をおいてからもう一度お試しください。';
   if (m === 'TOO_BIG') return '画像の合計サイズが大きすぎます。枚数を減らすか、小さい画像でやり直してください。';
+  if (m === 'BUSY') return 'AIサービス(Gemini)が混雑しています。\n少し待ってから、もう一度お試しください。(画像の場合は「解析」と送ると再試行できます)';
+  if (m === 'AUTH') return 'APIキーが無効のようです。管理者の方は GEMINI_API_KEY をご確認ください。';
+  if (m === 'PAGE_FETCH') return 'ページを取得できませんでした。ログインが必要なページや、アクセスを制限しているサイトは読み取れません。';
+  if (m === 'PAGE_EMPTY') return 'ページから文章を読み取れませんでした。表示を後から組み立てるサイトは読み取れないことがあります。画面のスクリーンショットを画像で送ると解析できます。';
   if (m === 'BLOCKED') return '解析できませんでした(動画が非公開、または年齢制限などの可能性があります)。';
-  return '解析に失敗しました。\n' + m.slice(0, 200);
+  return '解析に失敗しました。時間をおいてもう一度お試しください。\n(' + m.replace(/\s+/g, ' ').slice(0, 80) + ')';
+}
+
+/* ============================== Webページ読み取り ============================== */
+
+function extractWebUrl_(t) {
+  const m = t.match(/https?:\/\/[^\s<>"'、。」』)）]+/);
+  if (!m) return null;
+  const u = m[0];
+  if (extractYouTubeId_(u)) return null;
+  const host = (u.match(/^https?:\/\/([^\/:?#]+)/) || [])[1] || '';
+  // 内部/ローカル宛てのアドレスは取得しない
+  if (!/\./.test(host) || /^(localhost|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|0\.)/.test(host) || /\.(local|internal|localdomain)$/.test(host)) return null;
+  return u;
+}
+
+function fetchPage_(url) {
+  let res;
+  try {
+    res = UrlFetchApp.fetch(url, {
+      muteHttpExceptions: true, followRedirects: true,
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; RecipeBot/1.0)', 'Accept-Language': 'ja,en;q=0.8' },
+    });
+  } catch (e) {
+    throw new Error('PAGE_FETCH');
+  }
+  if (res.getResponseCode() !== 200) throw new Error('PAGE_FETCH');
+  const type = String((res.getHeaders() || {})['Content-Type'] || '');
+  if (type && !/html|xml|text/i.test(type)) throw new Error('PAGE_FETCH');
+  let html = res.getContentText();
+  const cs = ((type.match(/charset=([\w-]+)/i) || html.slice(0, 3000).match(/<meta[^>]+charset=["']?([\w-]+)/i) || [])[1] || '').toLowerCase();
+  if (cs && cs !== 'utf-8' && cs !== 'utf8') {
+    try { html = res.getContentText(cs); } catch (e) { /* 未対応の文字コードはそのまま */ }
+  }
+  return html;
+}
+
+function decodeEntities_(s) {
+  return String(s).replace(/&#x([0-9a-f]+);/gi, function (_, h) { return String.fromCharCode(parseInt(h, 16)); })
+    .replace(/&#(\d+);/g, function (_, d) { return String.fromCharCode(parseInt(d, 10)); })
+    .replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&amp;/g, '&');
+}
+
+function stripTags_(s) {
+  return decodeEntities_(String(s).replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '')).replace(/[ \t　]+/g, ' ').trim();
+}
+
+function pageText_(html) {
+  const body = html.replace(/<(script|style|noscript|svg|nav|footer|header|form|iframe)[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<\/(p|div|li|tr|h[1-6]|section|article|dt|dd)>|<br\s*\/?>/gi, '\n');
+  return decodeEntities_(body.replace(/<[^>]+>/g, ' ')).replace(/[ \t　]+/g, ' ').replace(/\s*\n\s*/g, '\n').replace(/\n{2,}/g, '\n').trim();
+}
+
+function pageTitle_(html) {
+  const og = html.match(/<meta[^>]+property=["']og:title["'][^>]*content=["']([^"']*)["']/i);
+  const t = og ? og[1] : (html.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1];
+  return t ? stripTags_(t).replace(/\s*[|｜\-－–—]\s*[^|｜\-－–—]{2,40}$/, '').trim() : '';
+}
+
+/** schema.org の Recipe(JSON-LD)があれば、AIを使わずに読み取る */
+function recipeFromJsonLd_(html) {
+  const re = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let m, found = null;
+  function walk(n) {
+    if (found || !n) return;
+    if (Array.isArray(n)) { n.forEach(walk); return; }
+    if (typeof n !== 'object') return;
+    const t = n['@type'];
+    if (t && [].concat(t).some(function (x) { return String(x).toLowerCase() === 'recipe'; })) { found = n; return; }
+    if (n['@graph']) walk(n['@graph']);
+    if (n.mainEntity) walk(n.mainEntity);
+    if (n.itemListElement) walk(n.itemListElement);
+  }
+  while ((m = re.exec(html)) && !found) {
+    try { walk(JSON.parse(m[1].trim())); } catch (e) { /* 壊れたJSON-LDは無視 */ }
+  }
+  if (!found) return null;
+  const r = found;
+  const str = function (v) { return v == null ? '' : (typeof v === 'object' ? str(v.text || v.name || '') : stripTags_(v)); };
+  const ingredients = [].concat(r.recipeIngredient || r.ingredients || []).map(str).filter(Boolean).map(splitIngredient_);
+  const steps = [];
+  (function collect(v) {
+    if (!v) return;
+    if (Array.isArray(v)) { v.forEach(collect); return; }
+    if (typeof v === 'string') { v.split(/\n+/).forEach(function (x) { x = stripTags_(x); if (x) steps.push(x); }); return; }
+    if (v.itemListElement) { collect(v.itemListElement); return; }
+    const x = str(v); if (x) steps.push(x);
+  })(r.recipeInstructions);
+  if (!ingredients.length || !steps.length) return null;
+  let yieldS = [].concat(r.recipeYield || '').map(str)[0] || '';
+  if (/^\d+$/.test(yieldS)) yieldS += '人分';
+  return {
+    title: str(r.name), servings: yieldS, ingredients: ingredients, steps: steps,
+    memo: str(r.description).slice(0, 200), via: 'ページのレシピ情報',
+  };
+}
+
+/** "玉ねぎ 1個" / "200g 鶏肉" / "塩" のような1行を 名前と分量に分ける(AIは使わない簡易版) */
+function splitIngredient_(line) {
+  const s = String(line).replace(/^[●・○◆■□▼▽★☆A-Za-zＡ-Ｚ]{1,2}[:：]\s*/, '').trim();
+  const parts = s.split(/[\s　]+/);
+  let name = s, amount = '';
+  if (parts.length >= 2) {
+    if (/^[\d０-９½¼¾]/.test(parts[0])) { amount = parts[0]; name = parts.slice(1).join(' '); }
+    else { name = parts[0]; amount = parts.slice(1).join(' '); }
+  }
+  return { name: name, amount: amount, tag: name };
+}
+
+function analyzeWebPage_(url) {
+  const html = fetchPage_(url);
+  const ld = recipeFromJsonLd_(html);
+  if (ld) {
+    if (!ld.title) ld.title = pageTitle_(html);
+    console.log('web: json-ld');
+    return ld;
+  }
+  const text = pageText_(html).slice(0, 12000);
+  if (text.length < 80) throw new Error('PAGE_EMPTY');
+  const title = pageTitle_(html);
+  const prompt = PROMPT_COMMON + '\n\n以下はWebページから取り出した文章です。ページ内のレシピ(材料と作り方)を抽出してください。広告・コメント・関連記事などは無視し、メインのレシピだけを対象にしてください。' +
+    '\n\n【ページのタイトル】' + title + '\n【本文】\n' + text;
+  const d = analyzeParts_(prompt, []);
+  if (!d.title) d.title = title;
+  return d;
 }
 
 function extractYouTubeId_(t) {
