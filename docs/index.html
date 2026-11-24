@@ -51,6 +51,11 @@
   .grp { display: flex; align-items: center; gap: 6px; margin-top: 18px; padding: 2px 0; border-bottom: 2px solid var(--marker); }
   .grp .gname { flex: 1 1 auto; min-width: 0; padding: 8px 0; font-weight: 700; }
   .grp:first-child { margin-top: 0; }
+  .grp .gadd { flex: none; border: 0; background: none; color: var(--ink); font-weight: 700; font-size: 13px; text-decoration: underline; text-decoration-color: var(--marker); text-decoration-thickness: 3px; text-underline-offset: 4px; cursor: pointer; padding: 8px 2px; }
+  .ing { flex-wrap: wrap; }
+  .ing .gsel { display: none; order: 9; flex: 0 0 auto; width: 58%; margin: 0 0 8px; padding: 6px 10px; font: inherit; font-size: 13px; color: var(--ink-soft); background: #fff; border: 1px solid var(--rule); border-radius: 8px; }
+  #ings.has-groups .gsel { display: block; }
+  .hint { margin: 6px 0 0; color: var(--ink-soft); font-size: 13px; line-height: 1.6; }
   .add-row { display: flex; gap: 20px; flex-wrap: wrap; }
 
   /* 調理器具(複数選べるチップ) */
@@ -101,8 +106,9 @@
     <div id="ings"></div>
     <div class="add-row">
       <button type="button" class="add" id="addIng">材料を追加</button>
-      <button type="button" class="add" id="addGrp">グループ見出しを追加</button>
+      <button type="button" class="add" id="addGrp">グループを追加</button>
     </div>
+    <p class="hint">「A」「合わせ調味料」などのグループを作ると、各材料の下の選択欄で、入れるグループを選べます。</p>
 
     <h2>調理器具</h2>
     <div class="tools" id="tools" role="group" aria-label="調理に使う器具"></div>
@@ -161,23 +167,60 @@
     d.innerHTML = '<input type="text" class="name" placeholder="食材" aria-label="食材名" maxlength="50" autocomplete="off">' +
       '<span class="leader" aria-hidden="true"></span>' +
       '<input type="text" class="amt" placeholder="分量" aria-label="分量" maxlength="40" autocomplete="off">' +
-      '<button type="button" class="x" aria-label="この材料を削除">×</button>';
+      '<button type="button" class="x" aria-label="この材料を削除">×</button>' +
+      '<select class="gsel" aria-label="この材料のグループ"></select>';
+    const sel = d.querySelector('.gsel');
+    groupOptions(sel, i.group || '');
+    sel.onchange = layout;
     d.querySelector('.name').value = i.name || '';
     d.querySelector('.amt').value = i.amount || '';
     d.querySelector('.x').onclick = () => d.remove();
     $('#ings').appendChild(d);
+    layout();
     return d;
   }
-  function addGrp(name) {
+  // ---- 材料のグループ(A / 合わせ調味料 など): 各材料で選んで入れる ----
+  let guid = 0;
+  const groups = [];          // { uid, name }
+  const gEls = new Map();     // uid -> 見出しの要素
+  function groupOptions(sel, val) {
+    sel.innerHTML = '';
+    const o0 = document.createElement('option'); o0.value = ''; o0.textContent = 'グループなし'; sel.appendChild(o0);
+    groups.forEach((g) => { const o = document.createElement('option'); o.value = g.uid; o.textContent = g.name || '(名前を入力してください)'; sel.appendChild(o); });
+    sel.value = groups.some((g) => g.uid === val) ? val : '';
+  }
+  function refreshSelects() {
+    document.querySelectorAll('#ings .gsel').forEach((sel) => groupOptions(sel, sel.value));
+    $('#ings').classList.toggle('has-groups', groups.length > 0);
+  }
+  // グループなし → 各グループ(見出し+その材料)の順に並べ直す
+  function layout() {
+    const wrap = $('#ings');
+    const rows = [...wrap.querySelectorAll('.ing')];
+    const of = (uid) => rows.filter((r) => r.querySelector('.gsel').value === uid);
+    of('').forEach((r) => wrap.appendChild(r));
+    groups.forEach((g) => { wrap.appendChild(gEls.get(g.uid)); of(g.uid).forEach((r) => wrap.appendChild(r)); });
+  }
+  function newGroup(name) {
+    const g = { uid: 'g' + (++guid), name: name || '' };
+    groups.push(g);
     const d = document.createElement('div');
     d.className = 'grp';
-    d.innerHTML = '<input type="text" class="gname" placeholder="見出し(例: A / 合わせ調味料)" aria-label="材料のグループ名" maxlength="30" autocomplete="off">' +
-      '<button type="button" class="x" aria-label="この見出しを削除">×</button>';
-    d.querySelector('.gname').value = name || '';
-    if (name === '') d.querySelector('.gname').placeholder = '見出し(空欄なら、ここから見出しなし)';
-    d.querySelector('.x').onclick = () => d.remove();
-    $('#ings').appendChild(d);
-    return d;
+    d.innerHTML = '<input type="text" class="gname" placeholder="グループ名(例: A / 合わせ調味料)" aria-label="グループ名" maxlength="30" autocomplete="off">' +
+      '<button type="button" class="gadd">＋材料</button>' +
+      '<button type="button" class="x" aria-label="このグループを削除(材料は残ります)">×</button>';
+    const inp = d.querySelector('.gname');
+    inp.value = g.name;
+    inp.addEventListener('input', () => { g.name = inp.value; refreshSelects(); });
+    d.querySelector('.gadd').onclick = () => { const r = addIng({ group: g.uid }); r.querySelector('.name').focus(); };
+    d.querySelector('.x').onclick = () => {
+      document.querySelectorAll('#ings .gsel').forEach((s) => { if (s.value === g.uid) s.value = ''; });
+      groups.splice(groups.indexOf(g), 1); gEls.delete(g.uid); d.remove();
+      refreshSelects(); layout();
+    };
+    gEls.set(g.uid, d);
+    refreshSelects(); layout();
+    return g;
   }
   const TOOLS = ['IH・コンロ', '電子レンジ', 'オーブン', 'トースター', '炊飯器', 'ホットプレート', '圧力鍋', '魚焼きグリル', '直火(IH不可)'];
   function renderTools(sel) {
@@ -205,7 +248,7 @@
     grow(ta);
     return d;
   }
-  $('#addGrp').onclick = () => addGrp().querySelector('.gname').focus();
+  $('#addGrp').onclick = () => { const g = newGroup(''); gEls.get(g.uid).querySelector('.gname').focus(); };
   $('#addIng').onclick = () => addIng().querySelector('.name').focus();
   $('#addStep').onclick = () => addStep().querySelector('textarea').focus();
   $('#memo').addEventListener('input', (e) => grow(e.target));
@@ -220,10 +263,10 @@
       title: $('#title').value.trim(),
       servings: $('#servings').value.trim(),
       ingredients: (() => {
-        let group = '';
         const out = [];
-        document.querySelectorAll('#ings > div').forEach((d) => {
-          if (d.classList.contains('grp')) { group = d.querySelector('.gname').value.trim(); return; }
+        document.querySelectorAll('#ings .ing').forEach((d) => {
+          const g = groups.find((x) => x.uid === d.querySelector('.gsel').value);
+          const group = g ? g.name.trim() : '';
           const name = d.querySelector('.name').value.trim();
           // 名前を書き換えた行は、自動で付けた検索用タグを引き継がない
           if (name) out.push({ name, amount: d.querySelector('.amt').value.trim(), tag: name === d.dataset.orig ? d.dataset.tag : '', group });
@@ -251,11 +294,10 @@
     $('#servings').value = rec.servings;
     $('#memo').value = rec.memo;
     renderTools(rec.tools);
-    let prevGroup = '';
+    const gByName = {};
+    (rec.ingredients || []).forEach((i) => { if (i.group && !gByName[i.group]) gByName[i.group] = newGroup(i.group); });
     (rec.ingredients.length ? rec.ingredients : [null]).forEach((i) => {
-      const g = (i && i.group) || '';
-      if (g !== prevGroup) { addGrp(g); prevGroup = g; }
-      addIng(i);
+      addIng(i && i.group ? Object.assign({}, i, { group: gByName[i.group].uid }) : i);
     });
     (rec.steps.length ? rec.steps : ['']).forEach(addStep);
     $('#lead').textContent = rec.status === 'draft'
