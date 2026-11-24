@@ -19,8 +19,22 @@
 
 const SHEET_NAME = 'recipes';
 const HEADERS = ['id', 'status', 'title', 'servings', 'ingredients', 'steps', 'ingredient_index',
-  'source_type', 'source_url', 'memo', 'created_by', 'created_at', 'updated_at'];
+  'source_type', 'source_url', 'memo', 'created_by', 'created_at', 'updated_at', 'tools'];
 const MAX_LIST = 12;
+
+/* 調理器具の分類(1つのレシピに複数付けられる) */
+const TOOLS = ['IH・コンロ', '電子レンジ', 'オーブン', 'トースター', '炊飯器', 'ホットプレート', '圧力鍋', '魚焼きグリル', '直火(IH不可)'];
+const TOOL_ALIASES = [
+  ['IH・コンロ', ['IH', 'ＩＨ', 'IHコンロ', 'IHヒーター', 'IHクッキングヒーター', 'インダクション', 'インダクションレンジ', 'ガス', 'ガスコンロ', 'コンロ', 'フライパン']],
+  ['電子レンジ', ['レンジ', '電子レンジ', 'チン']],
+  ['オーブン', ['オーブン']],
+  ['トースター', ['トースター', 'オーブントースター']],
+  ['炊飯器', ['炊飯器', '炊飯']],
+  ['ホットプレート', ['ホットプレート', 'ホットプレート']],
+  ['圧力鍋', ['圧力鍋']],
+  ['魚焼きグリル', ['グリル', '魚焼きグリル', '魚焼き']],
+  ['直火(IH不可)', ['直火', 'バーナー']],
+];
 
 const HELP = [
   '🍳 レシピBotの使い方',
@@ -38,6 +52,7 @@ const HELP = [
   '・食材名を送る(例: 鶏肉 / 鶏肉 玉ねぎ)→ その食材を使うレシピ一覧',
   '・料理名を送る(例: 肉じゃが)→ レシピを表示',
   '・「食材 〇〇」「料理 〇〇」と頭に付けると種類を指定できます',
+  '・調理器具で探す(例: IH / 電子レンジ / オーブン / 炊飯器)→ その器具で作れるレシピ(「調理 IH」でも可)',
   '・「一覧」→ 最近のレシピ / 「おまかせ」→ ランダム',
   '',
   '※グループでは「食材 〇〇」「料理 〇〇」「一覧」「おまかせ」が使えます。',
@@ -151,6 +166,10 @@ function onText_(ev, raw) {
     return send_(ev, text_(n ? '預かっていた画像 ' + n + '枚を破棄しました。' : '預かっている画像はありません。'));
   }
 
+  if (!isGroup_(ev) && /^(分類更新|分類を更新)$/.test(t)) {
+    return send_(ev, text_('登録済みのレシピのうち、分類が空のもの ' + backfillTools_() + '件に、作り方から調理器具の分類を付けました。\n(簡易判定です。違うものはレシピの「修正する」で直せます)'));
+  }
+
   if (/^(一覧|レシピ一覧|新着)$/.test(t)) {
     const rs = confirmed_().sort(byNewest_);
     if (!rs.length) return send_(ev, text_('まだレシピが登録されていません。YouTubeのURLか画像を送ってみてください。'));
@@ -170,6 +189,11 @@ function onText_(ev, raw) {
 
   let m = t.match(/^(食材|材料)[\s:：]+(.+)$/);
   if (m) return searchByIngredients_(ev, m[2]);
+  m = t.match(/^(調理|器具|調理器具|分類)[\s:：]+(.+)$/);
+  if (m) {
+    const tool = toolFromQuery_(norm_(m[2])) || normTools_(m[2])[0];
+    return tool ? searchByTool_(ev, tool, m[2].trim()) : send_(ev, text_('分類は次のとおりです。\n' + TOOLS.join(' / ') + '\n例: 「調理 IH」「調理 電子レンジ」'));
+  }
   m = t.match(/^(料理|レシピ)[\s:：]+(.+)$/);
   if (m) return searchByTitle_(ev, m[2]);
 
@@ -404,6 +428,8 @@ function smartSearch_(ev, text) {
   const q = norm_(text);
   if (!q) return;
   const rs = confirmed_();
+  const tool = toolFromQuery_(q);
+  if (tool && !rs.some(function (r) { return norm_(r.title) === q; })) return searchByTool_(ev, tool, text.trim());
   const exact = rs.filter(function (r) { return norm_(r.title) === q; });
   if (exact.length === 1) return send_(ev, recipeFlex_(exact[0]));
 
@@ -483,9 +509,16 @@ function recipeFlex_(r) {
     { type: 'text', text: r.title || '(無題)', weight: 'bold', size: 'lg', wrap: true },
   ];
   if (r.servings) body.push({ type: 'text', text: r.servings, size: 'sm', color: '#888888', wrap: true });
+  if (r.tools && r.tools.length) body.push({ type: 'text', text: '🍳 ' + r.tools.join(' / '), size: 'xs', color: '#888888', wrap: true });
   body.push({ type: 'separator', margin: 'md' });
   body.push({ type: 'text', text: '【材料】', weight: 'bold', size: 'sm', margin: 'md' });
+  let curGroup = '';
   r.ingredients.forEach(function (i) {
+    const g = i.group || '';
+    if (g !== curGroup) {
+      curGroup = g;
+      if (g) body.push({ type: 'text', text: '■ ' + g, size: 'xs', weight: 'bold', color: '#06C755', margin: 'md', wrap: true });
+    }
     body.push({
       type: 'box', layout: 'horizontal', spacing: 'sm', contents: [
         { type: 'text', text: i.name || '-', size: 'sm', flex: 3, wrap: true },
@@ -606,14 +639,15 @@ const RECIPE_SCHEMA = {
       type: 'ARRAY',
       items: {
         type: 'OBJECT',
-        properties: { name: { type: 'STRING' }, amount: { type: 'STRING' }, tag: { type: 'STRING' } },
-        required: ['name', 'amount', 'tag'],
+        properties: { name: { type: 'STRING' }, amount: { type: 'STRING' }, tag: { type: 'STRING' }, group: { type: 'STRING' } },
+        required: ['name', 'amount', 'tag', 'group'],
       },
     },
     steps: { type: 'ARRAY', items: { type: 'STRING' } },
     memo: { type: 'STRING' },
+    tools: { type: 'ARRAY', items: { type: 'STRING' } },
   },
-  required: ['is_recipe', 'title', 'servings', 'ingredients', 'steps', 'memo'],
+  required: ['is_recipe', 'title', 'servings', 'ingredients', 'steps', 'memo', 'tools'],
 };
 
 const PROMPT_COMMON = [
@@ -623,7 +657,9 @@ const PROMPT_COMMON = [
   '- servings: 何人分か(例: "2人分")。不明なら空文字。',
   '- ingredients: 材料。name は一般的な表記(例: 玉ねぎ、鶏もも肉、しょうゆ)。amount は分量(例: "2個", "大さじ1")。不明なら "適量" か空文字。',
   '  tag は検索用の大まかな食材名(例: 鶏もも肉→鶏肉、長ねぎ→ねぎ、豚バラ薄切り肉→豚肉)。分類できなければ name と同じにする。',
+  '- group: 材料が「A」「B」「合わせ調味料」「たれ」「トッピング」などのグループに分かれている場合、元の表記のまま入れる(例: "A"、"合わせ調味料")。グループがなければ空文字。作り方で「Aを混ぜる」と書かれていることがあるため、記号は変えない。',
   '- steps: 作り方を順番に。1工程は1〜2文で簡潔に。番号は付けない。',
+  '- tools: 調理で実際に使う器具を、次から当てはまるものすべて選ぶ(複数可): IH・コンロ(フライパン・鍋などで火にかける調理), 電子レンジ, オーブン, トースター, 炊飯器, ホットプレート, 圧力鍋, 魚焼きグリル, 直火(IH不可)(バーナーであぶる等、直火が必須の場合のみ)。加熱しない料理や、書かれていない器具は入れない。使うものがなければ空配列。',
   '- memo: コツ・ポイントがあれば短く。なければ空文字。',
   '- 情報にないことを推測で補わない。',
 ].join('\n');
@@ -637,7 +673,7 @@ function listProp_(key, def) {
 }
 
 const JSON_TAIL = '\n\n出力はJSONのみ(説明文やコードブロックは不要)。形式: ' +
-  '{"is_recipe":true,"title":"","servings":"","ingredients":[{"name":"","amount":"","tag":""}],"steps":[""],"memo":""}';
+  '{"is_recipe":true,"title":"","servings":"","ingredients":[{"name":"","amount":"","tag":"","group":""}],"steps":[""],"memo":"","tools":[""]}';
 
 function analyzeYouTube_(url) {
   // YouTube URLを直接読めるのはGeminiのみ。モデルを順に試す
@@ -782,10 +818,11 @@ function toRecipe_(obj) {
     title: String(obj.title || '').trim(),
     servings: String(obj.servings || '').trim(),
     ingredients: (obj.ingredients || []).map(function (i) {
-      return { name: String(i.name || '').trim(), amount: String(i.amount || '').trim(), tag: String(i.tag || '').trim() };
+      return { name: String(i.name || '').trim(), amount: String(i.amount || '').trim(), tag: String(i.tag || '').trim(), group: String(i.group || '').trim() };
     }).filter(function (i) { return i.name; }),
     steps: (obj.steps || []).map(function (s) { return String(s).trim(); }).filter(Boolean),
     memo: String(obj.memo || '').trim(),
+    tools: normTools_(obj.tools),
   };
 }
 
@@ -800,6 +837,73 @@ function friendlyError_(err) {
   if (m === 'PAGE_EMPTY') return 'ページから文章を読み取れませんでした。表示を後から組み立てるサイトは読み取れないことがあります。画面のスクリーンショットを画像で送ると解析できます。';
   if (m === 'BLOCKED') return '解析できませんでした(動画が非公開、または年齢制限などの可能性があります)。';
   return '解析に失敗しました。時間をおいてもう一度お試しください。\n(' + m.replace(/\s+/g, ' ').slice(0, 80) + ')';
+}
+
+/* ============================== 調理器具の分類 ============================== */
+
+/** AIや入力が返した器具名を、決まった分類名に揃える(複数可・重複なし・分類の並び順) */
+function normTools_(v) {
+  const arr = Array.isArray(v) ? v : String(v || '').split(/[|,、，/／]+/);
+  const rules = [
+    [/IH|ＩＨ|インダクション/i, 'IH・コンロ'], [/圧力/, '圧力鍋'], [/グリル|魚焼き/, '魚焼きグリル'], [/直火|バーナー/, '直火(IH不可)'],
+    [/レンジ/, '電子レンジ'], [/トースター/, 'トースター'], [/オーブン/, 'オーブン'],
+    [/炊飯/, '炊飯器'], [/ホットプレート/, 'ホットプレート'], [/IH|ＩＨ|インダクション|コンロ|ガス|フライパン|鍋/i, 'IH・コンロ'],
+  ];
+  const got = {};
+  arr.forEach(function (x) {
+    x = String(x || '').trim();
+    if (!x) return;
+    if (TOOLS.indexOf(x) >= 0) { got[x] = true; return; }
+    for (let i = 0; i < rules.length; i++) if (rules[i][0].test(x)) { got[rules[i][1]] = true; return; }
+  });
+  return TOOLS.filter(function (t) { return got[t]; });
+}
+
+/** 作り方の文章から器具をざっくり判定する(AIを使わない簡易版) */
+function inferTools_(text) {
+  const t = String(text || '');
+  const found = [];
+  if (/圧力鍋|圧力/.test(t)) found.push('圧力鍋');
+  if (/レンジ|チンする|\d{3}W/.test(t)) found.push('電子レンジ');
+  if (/オーブン(?!トースター)/.test(t)) found.push('オーブン');
+  if (/トースター/.test(t)) found.push('トースター');
+  if (/炊飯器|炊飯/.test(t)) found.push('炊飯器');
+  if (/ホットプレート/.test(t)) found.push('ホットプレート');
+  if (/グリル|魚焼き/.test(t)) found.push('魚焼きグリル');
+  if (/直火|バーナー/.test(t)) found.push('直火(IH不可)');
+  if (/炒め|煮|茹で|ゆで|揚げ|フライパン|鍋|コンロ|[強中弱]火/.test(t)) found.push('IH・コンロ');
+  return normTools_(found);
+}
+
+function toolFromQuery_(q) {
+  for (let i = 0; i < TOOL_ALIASES.length; i++) {
+    if (TOOL_ALIASES[i][1].some(function (w) { return norm_(w) === q; })) return TOOL_ALIASES[i][0];
+  }
+  return null;
+}
+
+function toolHits_(tool) {
+  return confirmed_().filter(function (r) {
+    if (r.tools.indexOf(tool) < 0) return false;
+    return !(tool === 'IH・コンロ' && r.tools.indexOf('直火(IH不可)') >= 0); // IH検索では直火必須のものを除く
+  }).sort(byNewest_);
+}
+
+function searchByTool_(ev, tool, label) {
+  const hits = toolHits_(tool);
+  if (!hits.length) return send_(ev, text_('「' + label + '」の分類のレシピはまだありません。\n登録済みのレシピに分類を付けるには、1対1のトークで「分類更新」と送ってください。'));
+  send_(ev, listFlex_(hits, '「' + tool + '」のレシピ'));
+}
+
+/** 分類がまだ空の保存済みレシピに、作り方から器具を付ける */
+function backfillTools_() {
+  let n = 0;
+  readAll_().forEach(function (r) {
+    if (r.status !== 'confirmed' || r.tools.length) return;
+    const t = inferTools_(r.steps.join('\n'));
+    if (t.length) { updateRecipe_(r.id, { tools: t }); n++; }
+  });
+  return n;
 }
 
 /* ============================== Webページ読み取り ============================== */
@@ -879,7 +983,15 @@ function recipeFromJsonLd_(html) {
   if (!found) return null;
   const r = found;
   const str = function (v) { return v == null ? '' : (typeof v === 'object' ? str(v.text || v.name || '') : stripTags_(v)); };
-  const ingredients = [].concat(r.recipeIngredient || r.ingredients || []).map(str).filter(Boolean).map(splitIngredient_);
+  const ingredients = [];
+  let grp = '';
+  [].concat(r.recipeIngredient || r.ingredients || []).map(str).filter(Boolean).forEach(function (line) {
+    const h = groupHeader_(line);
+    if (h !== null) { grp = h; return; }
+    const i = splitIngredient_(line);
+    if (!i.group) i.group = grp;
+    ingredients.push(i);
+  });
   const steps = [];
   (function collect(v) {
     if (!v) return;
@@ -893,20 +1005,31 @@ function recipeFromJsonLd_(html) {
   if (/^\d+$/.test(yieldS)) yieldS += '人分';
   return {
     title: str(r.name), servings: yieldS, ingredients: ingredients, steps: steps,
-    memo: str(r.description).slice(0, 200), via: 'ページのレシピ情報',
+    memo: str(r.description).slice(0, 200), via: 'ページのレシピ情報', tools: inferTools_(steps.join('\n')),
   };
 }
 
-/** "玉ねぎ 1個" / "200g 鶏肉" / "塩" のような1行を 名前と分量に分ける(AIは使わない簡易版) */
+/** 「【A】」「＜合わせ調味料＞」「たれ:」のような見出しだけの行ならグループ名を返す(違えば null) */
+function groupHeader_(line) {
+  const t = String(line).trim();
+  let m = t.match(/^[【＜<\[［（(]\s*([^】＞>\]］）)]{1,20}?)\s*[】＞>\]］）)]$/);
+  if (!m) m = t.match(/^([^\s:：]{1,15})[:：]$/);
+  if (!m) m = t.match(/^([A-ZＡ-Ｚ])$/);
+  return m ? m[1].trim() : null;
+}
+
+/** "玉ねぎ 1個" / "200g 鶏肉" / "A しょうゆ 大さじ1" のような1行を 名前・分量・グループに分ける(AIは使わない簡易版) */
 function splitIngredient_(line) {
-  const s = String(line).replace(/^[●・○◆■□▼▽★☆A-Za-zＡ-Ｚ]{1,2}[:：]\s*/, '').trim();
-  const parts = s.split(/[\s　]+/);
+  let s = String(line).trim(), group = '';
+  const g = s.match(/^[【＜<\[［（(]?\s*([A-ZＡ-Ｚ])\s*[】＞>\]］）):：]\s*(.*)$/) || s.match(/^([A-ZＡ-Ｚ])[\s\u3000]+(\S.*)$/);
+  if (g) { group = g[1]; s = g[2].trim(); }
+  const parts = s.split(/[\s\u3000]+/);
   let name = s, amount = '';
   if (parts.length >= 2) {
     if (/^[\d０-９½¼¾]/.test(parts[0])) { amount = parts[0]; name = parts.slice(1).join(' '); }
     else { name = parts[0]; amount = parts.slice(1).join(' '); }
   }
-  return { name: name, amount: amount, tag: name };
+  return { name: name, amount: amount, tag: name, group: group };
 }
 
 function analyzeWebPage_(url) {
@@ -982,7 +1105,7 @@ function handleApi_(b) {
 function publicRecipe_(r) {
   return {
     id: r.id, status: r.status, title: r.title, servings: r.servings, ingredients: r.ingredients,
-    steps: r.steps, memo: r.memo, source_type: r.source_type, source_url: r.source_url,
+    steps: r.steps, memo: r.memo, source_type: r.source_type, source_url: r.source_url, tools: r.tools || [],
   };
 }
 
@@ -992,10 +1115,11 @@ function sanitize_(x) {
     title: s(x.title, 100),
     servings: s(x.servings, 30),
     ingredients: (Array.isArray(x.ingredients) ? x.ingredients : []).slice(0, 60).map(function (i) {
-      return { name: s(i.name, 50), amount: s(i.amount, 40), tag: s(i.tag, 50) };
+      return { name: s(i.name, 50), amount: s(i.amount, 40), tag: s(i.tag, 50), group: s(i.group, 30) };
     }).filter(function (i) { return i.name; }),
     steps: (Array.isArray(x.steps) ? x.steps : []).slice(0, 60).map(function (v) { return s(v, 500); }).filter(Boolean),
     memo: s(x.memo, 1000),
+    tools: normTools_(x.tools),
   };
 }
 
@@ -1010,8 +1134,14 @@ function sheet_() {
     sh.getRange(1, 1, sh.getMaxRows(), HEADERS.length).setNumberFormat('@'); // 全列テキスト扱い
     sh.setFrozenRows(1);
   }
+  if (!HEADER_CHECKED_) { // 以前のシートに、増えた列の見出しを足す
+    HEADER_CHECKED_ = true;
+    const head = sh.getRange(1, 1, 1, HEADERS.length).getValues()[0];
+    HEADERS.forEach(function (h, i) { if (!head[i]) sh.getRange(1, i + 1, 1, 1).setValues([[h]]).setFontWeight('bold').setNumberFormat('@'); });
+  }
   return sh;
 }
+let HEADER_CHECKED_ = false;
 
 function readAll_() {
   const sh = sheet_();
@@ -1030,12 +1160,14 @@ function rowToObj_(row, rowNum) {
   o.id = String(o.id);
   o.ingredients = parseJson_(o.ingredients, []);
   o.steps = parseJson_(o.steps, []);
+  o.tools = normTools_(String(o.tools || ''));
   return o;
 }
 
 function objToRow_(r) {
   return HEADERS.map(function (h) {
     if (h === 'ingredients' || h === 'steps') return JSON.stringify(r[h] || []);
+    if (h === 'tools') return (r.tools || []).join('|');
     return r[h] == null ? '' : r[h];
   });
 }
@@ -1073,7 +1205,7 @@ function saveNew_(fields) {
     const now = new Date().toISOString();
     const r = Object.assign({
       id: Utilities.getUuid().replace(/-/g, '').slice(0, 8), status: 'draft', title: '', servings: '',
-      ingredients: [], steps: [], source_type: 'manual', source_url: '', memo: '', created_by: '',
+      ingredients: [], steps: [], source_type: 'manual', source_url: '', memo: '', created_by: '', tools: [],
       created_at: now, updated_at: now,
     }, fields);
     r.ingredient_index = buildIndex_(r.ingredients);
